@@ -2,3 +2,5 @@ data_cache/
 backtest_results/
 __pycache__/
 results_share/
+orders/
+my_portfolio*.csv

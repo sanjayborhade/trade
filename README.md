@@ -39,3 +39,20 @@ python carver_portfolio.py -t M                # monthly
 python carver_portfolio.py -t W --rank random --runs 20   # how much the ranking choice matters
 python carver_portfolio.py -t W --max-pos 30 --cash-rate 6
 ```
+
+## Friday-evening orders (live use)
+
+`weekly_orders.py` reads your holdings from `my_portfolio.csv` and prints exactly what to SELL and BUY
+at Monday's open for the 20-stock weekly strategy (same rules as `carver_portfolio.py`).
+
+```
+Symbol,Qty,BuyPrice,BuyDate
+CASH,250000,,
+TCS,10,3950,2026-08-03
+```
+
+```bash
+python weekly_orders.py              # run after 15:45 IST Friday, or over the weekend
+python weekly_orders.py --apply      # also writes my_portfolio_next.csv with the planned changes
+```
+Update `my_portfolio.csv` with the real fills after Monday's open.
