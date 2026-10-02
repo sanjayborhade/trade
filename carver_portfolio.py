@@ -70,6 +70,7 @@ def simulate(panel: dict[str, pd.DataFrame], start: pd.Timestamp, max_pos: int, 
     O = panel["open"].loc[dates].to_numpy()
     C = panel["close"].loc[dates].ffill().to_numpy()   # last known close for marking
     F = panel["fc"].loc[dates].to_numpy()
+    F_prev = panel["fc"].shift(1).loc[dates].to_numpy()  # previous bar, also for the first simulated bar
     S = panel["strength"].loc[dates].to_numpy()
     V = panel["vol"].loc[dates].to_numpy()
     has_bar = ~np.isnan(panel["close"].loc[dates].to_numpy())
@@ -121,8 +122,7 @@ def simulate(panel: dict[str, pd.DataFrame], start: pd.Timestamp, max_pos: int, 
         if free > 0:
             ok = ~held & has_bar[t] & (F[t] >= entry - 1e-9)
             if fresh_only:  # only stocks that crossed up to the entry level on THIS bar
-                prev = F[t - 1] if t else np.full(len(syms), np.nan)
-                ok &= ~(prev >= entry - 1e-9)
+                ok &= ~(F_prev[t] >= entry - 1e-9)
             if once == "per-stock":   # never buy a stock a second time
                 ok &= ~traded
             elif once == "first-ever":  # only on the first-ever touch of 20
