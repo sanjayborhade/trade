@@ -106,14 +106,18 @@ def carver_forecast(close: pd.Series, timeframe: str = "M", p: Params = Params()
 
     # 2. Per-speed forecasts
     out = pd.DataFrame(index=close.index)
+    uncapped = []
     for fast, slow, scalar in SPEEDS:
         raw = (pine_ema(close, fast) - pine_ema(close, slow)) / daily_vol
         out[f"ewmac_{fast}_{slow}"] = (raw * scalar).clip(-p.f_cap, p.f_cap)
+        uncapped.append(raw * scalar)
 
     # 3. Combine: equal weight over speeds that have a value, times FDM, capped
     fc = out[[f"ewmac_{f}_{s}" for f, s, _ in SPEEDS]]
     out["n_speeds"] = fc.notna().sum(axis=1)
     out["combined"] = (fc.mean(axis=1, skipna=True) * p.div_mult).clip(-p.f_cap, p.f_cap)
+    # trend strength without any cap: tells apart stocks that all sit at +20
+    out["strength"] = pd.concat(uncapped, axis=1).mean(axis=1, skipna=True) * p.div_mult
     out["ann_vol_pct"] = ann_vol_pct
     return out
 

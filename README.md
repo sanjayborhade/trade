@@ -27,3 +27,15 @@ python carver_backtest.py --start 2010-01-01 --cost 0.2
 
 Yahoo's price data has bad ticks and unadjusted splits; one-day moves above +50% / below -33%
 are treated as data errors and adjusted out before testing.
+
+## Capped portfolio (max 20 stocks)
+
+`carver_portfolio.py` simulates a real account: capital split into 20 slots, each new position gets
+1/20 of current portfolio value, extra signals ranked by trend strength (or `--rank lowvol|random`).
+
+```bash
+python carver_portfolio.py -t W                # weekly, 20 slots -> backtest_results/portfolio_weekly/
+python carver_portfolio.py -t M                # monthly
+python carver_portfolio.py -t W --rank random --runs 20   # how much the ranking choice matters
+python carver_portfolio.py -t W --max-pos 30 --cash-rate 6
+```

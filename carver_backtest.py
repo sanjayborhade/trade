@@ -110,8 +110,9 @@ def load_prices(symbols: list[str], refresh: bool) -> tuple[dict[str, pd.DataFra
     if missing:
         print(f"Downloading daily prices for {len(missing)} tickers...", file=sys.stderr)
         cached.update(download_ohlc(missing))
+        cached.update({t: None for t in missing if t not in cached})  # remember failed tickers
         pd.to_pickle(cached, cache)
-    stocks = {s: clean_prices(cached[f"{s}.NS"]) for s in symbols if f"{s}.NS" in cached}
+    stocks = {s: clean_prices(cached[f"{s}.NS"]) for s in symbols if cached.get(f"{s}.NS") is not None}
     bench = cached.get(BENCHMARK)
     return stocks, clean_prices(bench) if bench is not None else None
 
