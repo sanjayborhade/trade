@@ -8,6 +8,7 @@ simulates a real account with a maximum number of positions:
     * a new position gets 1/N of the CURRENT portfolio value (cash permitting);
       positions are not rebalanced afterwards
     * ENTRY : forecast >= 20 at a bar's close and a slot is free -> buy next open
+              (--fresh-only: only if it was below 20 on the bar before)
     * EXIT  : forecast <  19 at a bar's close                    -> sell next open
     * sells are done before buys, so a freed slot can be reused the same day
     * when more stocks qualify than there are free slots, they are ranked by:
@@ -51,7 +52,7 @@ def build_panel(stocks: dict[str, pd.DataFrame], tf: str, p: Params) -> dict[str
 
 def simulate(panel: dict[str, pd.DataFrame], start: pd.Timestamp, max_pos: int, entry: float,
              exit_: float, cost: float, rank: str, cash_rate: float, per_year: int,
-             seed: int = 0) -> tuple[pd.DataFrame, pd.DataFrame]:
+             seed: int = 0, fresh_only: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(seed)
     dates = panel["close"].index[panel["close"].index >= start]
     syms = np.array(panel["close"].columns)
@@ -106,7 +107,11 @@ def simulate(panel: dict[str, pd.DataFrame], start: pd.Timestamp, max_pos: int, 
         to_sell = list(dict.fromkeys(to_sell + new_sells))  # keep sells that could not fill yet
         free = max_pos - int(held.sum()) + len(to_sell)
         if free > 0:
-            cand = np.where(~held & has_bar[t] & (F[t] >= entry - 1e-9))[0]
+            ok = ~held & has_bar[t] & (F[t] >= entry - 1e-9)
+            if fresh_only:  # only stocks that crossed up to the entry level on THIS bar
+                prev = F[t - 1] if t else np.full(len(syms), np.nan)
+                ok &= ~(prev >= entry - 1e-9)
+            cand = np.where(ok)[0]
             if len(cand):
                 if rank == "strength":
                     cand = cand[np.argsort(-S[t, cand])]
@@ -149,6 +154,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Capped-portfolio backtest of the Carver +20 strategy")
     ap.add_argument("--timeframe", "-t", choices=["D", "W", "M"], default="W")
     ap.add_argument("--max-pos", type=int, default=20, help="maximum open positions (default 20)")
+    ap.add_argument("--fresh-only", action="store_true",
+                    help="buy only stocks that crossed up to the entry level on the latest bar "
+                         "(default: any stock currently at the entry level)")
     ap.add_argument("--rank", choices=["strength", "lowvol", "random"], default="strength",
                     help="which stocks to buy when more qualify than free slots")
     ap.add_argument("--runs", type=int, default=1, help="with --rank random: number of random runs")
@@ -178,12 +186,14 @@ def main() -> None:
     results, last = {}, None
     for k in range(runs):
         curve, trades = simulate(panel, start, args.max_pos, args.entry, args.exit, args.cost / 100,
-                                 args.rank, args.cash_rate, per_year, seed=args.seed + k)
+                                 args.rank, args.cash_rate, per_year, seed=args.seed + k,
+                                 fresh_only=args.fresh_only)
         results[f"run {k + 1}" if runs > 1 else "Strategy"] = summarize(curve, trades, bench_close, per_year)
         last = (curve, trades)
     curve, trades = last
 
     print(f"##### {TF_NAME[tf]}, max {args.max_pos} positions, rank={args.rank}, "
+          f"entries={'fresh crosses only' if args.fresh_only else 'any stock at 20'}, "
           f"cost {args.cost}%/side, cash {args.cash_rate}%/yr #####")
     print(f"Period: {curve.index[0]:%Y-%m-%d} to {curve.index[-1]:%Y-%m-%d}\n")
     table = pd.DataFrame(results)

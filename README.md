@@ -52,7 +52,11 @@ TCS,10,3950,2026-08-03
 ```
 
 ```bash
-python weekly_orders.py              # run after 15:45 IST Friday, or over the weekend
-python weekly_orders.py --apply      # also writes my_portfolio_next.csv with the planned changes
+python weekly_orders.py                          # run after 15:45 IST Friday, or over the weekend
+python weekly_orders.py --monthly-limit 75000    # cap new buys per calendar month
+python weekly_orders.py --apply                  # also writes my_portfolio_next.csv with the planned changes
+python weekly_orders.py --as-of 2026-07-24       # replay a past Friday
 ```
+Defaults (edit the SETTINGS block at the top of the script): capital ₹3,00,000, 20 positions
+(slot ₹15,000), only stocks that crossed up to 20 this week are bought.
 Update `my_portfolio.csv` with the real fills after Monday's open.
