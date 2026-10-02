@@ -12,3 +12,13 @@ python carver_scanner.py -t W --closed-only    # weekly, closed bars only
 python carver_scanner.py --threshold 19.5      # near-touch tolerance
 python carver_scanner.py --out hits.csv        # save results
 ```
+
+## Backtest
+
+`carver_backtest.py` backtests: enter when the monthly forecast reaches 20, exit when it drops below 19,
+orders filled at the next month's open, Nifty 500 universe.
+
+```bash
+python carver_backtest.py                      # trades + stats + equity curve in backtest_results/
+python carver_backtest.py --start 2010-01-01 --cost 0.2
+```
