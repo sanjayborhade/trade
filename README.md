@@ -40,23 +40,24 @@ python carver_portfolio.py -t W --rank random --runs 20   # how much the ranking
 python carver_portfolio.py -t W --max-pos 30 --cash-rate 6
 ```
 
-## Friday-evening orders (live use)
+## Live orders (monthly by default)
 
-`weekly_orders.py` reads your holdings from `my_portfolio.csv` and prints exactly what to SELL and BUY
-at Monday's open for the 20-stock weekly strategy (same rules as `carver_portfolio.py`).
+`carver_orders.py` reads your holdings from `my_portfolio.csv` and prints exactly what to SELL and BUY
+at the next session's open for the 20-stock strategy (same rules as `carver_portfolio.py --fresh-only`).
+Monthly: run after the close on the last trading day of the month. Weekly: `-t W`, Friday evening.
 
 ```
 Symbol,Qty,BuyPrice,BuyDate
-CASH,250000,,
-TCS,10,3950,2026-08-03
+CASH,300000,,
+TCS,4,3950,2026-08-03
 ```
 
 ```bash
-python weekly_orders.py                          # run after 15:45 IST Friday, or over the weekend
-python weekly_orders.py --monthly-limit 75000    # cap new buys per calendar month
-python weekly_orders.py --apply                  # also writes my_portfolio_next.csv with the planned changes
-python weekly_orders.py --as-of 2026-07-24       # replay a past Friday
+python carver_orders.py                          # monthly, capital 300000, 20 slots of 15000
+python carver_orders.py --monthly-limit 75000    # cap new buys per calendar month
+python carver_orders.py --apply                  # also writes my_portfolio_next.csv with the planned changes
+python carver_orders.py --as-of 2026-07-31       # replay a past month-end
+python carver_orders.py -t W                     # weekly version
 ```
-Defaults (edit the SETTINGS block at the top of the script): capital ₹3,00,000, 20 positions
-(slot ₹15,000), only stocks that crossed up to 20 this week are bought.
-Update `my_portfolio.csv` with the real fills after Monday's open.
+Defaults (edit the SETTINGS block at the top of the script): monthly, capital ₹3,00,000,
+20 positions (slot ₹15,000), only stocks that crossed up to 20 on the latest bar are bought.

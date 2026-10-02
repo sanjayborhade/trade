@@ -1,15 +1,16 @@
 """
-Friday-evening order generator for the Carver EWMAC "+20" strategy (20-stock portfolio).
+Order generator for the Carver EWMAC "+20" strategy (20-stock portfolio).
 
-Run it after the NSE close on Friday (or any time over the weekend / before
-Monday's open). It reads YOUR holdings, checks every stock on the closed
-weekly bar, and prints exactly what to SELL and BUY at Monday's open.
+MONTHLY (default): run after the close on the LAST trading day of the month
+(or any time before the next session opens). WEEKLY (-t W): run on Friday evening.
+It reads YOUR holdings, checks every Nifty 500 stock on the just-closed bar and
+prints exactly what to SELL and BUY at the next session's open.
 
 Rules (same as the backtest: carver_portfolio.py --fresh-only):
-    SELL : a holding whose weekly forecast is below 19
-    BUY  : stocks whose forecast crossed UP to 20 this week (was below 20 last
-           week) and that you don't hold, strongest trend first, until you
-           have 20 positions
+    SELL : a holding whose forecast is below 19
+    BUY  : stocks whose forecast crossed UP to 20 on this bar (was below 20 on
+           the bar before) and that you don't hold, strongest trend first,
+           until you have 20 positions
     SIZE : each buy is CAPITAL / 20 (default 300000 / 20 = 15000); the total
            amount invested (at cost) never goes above CAPITAL
     MONTHLY LIMIT (optional): new buys in one calendar month stop at this amount
@@ -24,16 +25,16 @@ capital cap limits buys):
     TCS,4,3950,2026-08-03
     BEL,40,385.5,2026-07-20
 
-After Monday's orders are filled, update this file with the real quantities,
-prices and remaining cash (or run with --apply to write the planned changes
-to a new file my_portfolio_next.csv that you can check and rename).
+After the orders are filled, update this file with the real quantities, prices
+and remaining cash (or run with --apply to write the planned changes to
+my_portfolio_next.csv, check it, and rename it).
 
 Usage
-    python weekly_orders.py                      # weekly, 20 positions, capital 300000
-    python weekly_orders.py --capital 300000 --monthly-limit 75000
-    python weekly_orders.py --max-pos 20 --portfolio my_portfolio.csv
-    python weekly_orders.py --apply              # also write my_portfolio_next.csv
-    python weekly_orders.py -t M                 # monthly version (run after month end)
+    python carver_orders.py                       # monthly, 20 positions, capital 300000
+    python carver_orders.py --monthly-limit 75000
+    python carver_orders.py --apply               # also write my_portfolio_next.csv
+    python carver_orders.py --as-of 2026-07-31    # replay a past month-end
+    python carver_orders.py -t W                  # weekly version (Friday evening)
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ from carver_backtest import CACHE_DIR, TF_NAME, clean_prices, download_ohlc, to_
 from carver_scanner import Params, carver_forecast, load_nifty500
 
 # ============================ SETTINGS ======================================
+TIMEFRAME = "M"          # "M" = monthly (run after the last trading day of the month), "W" = weekly
 CAPITAL = 300_000        # total money for this strategy (max invested at cost)
 MAX_POSITIONS = 20       # slot size = CAPITAL / MAX_POSITIONS
 MONTHLY_LIMIT = None     # e.g. 75_000 to cap new buys per calendar month; None = no limit
@@ -106,16 +108,17 @@ def update_prices(tickers: list[str], refresh: bool, skip_update: bool = False) 
 
 
 def closed_bars(daily: pd.DataFrame, tf: str, now: dt.datetime) -> pd.DataFrame:
-    """Bars whose period has ended (a Friday-labelled week counts as closed after 15:45 IST Friday)."""
+    """Keep only bars whose period has ended.
+
+    A week / month counts as closed once its LAST WEEKDAY has passed 15:45 IST
+    (so a month ending on a Saturday/Sunday is closed on Friday evening)."""
     bars = to_bars(daily, tf, drop_current=False)
     if bars.empty:
         return bars
-    end = bars.index[-1].date()
-    if tf == "D":
-        end_ok = end < now.date() or now.time() >= MARKET_DONE
-    else:
-        end_ok = end < now.date() or (end == now.date() and now.time() >= MARKET_DONE)
-    return bars if end_ok else bars.iloc[:-1]
+    end = pd.Timestamp(bars.index[-1])
+    last_weekday = (end if end.weekday() < 5 else end - pd.offsets.BDay(1)).date()
+    closed = now.date() > last_weekday or (now.date() == last_weekday and now.time() >= MARKET_DONE)
+    return bars if closed else bars.iloc[:-1]
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +143,9 @@ def read_portfolio(path: str) -> tuple[pd.DataFrame, float]:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Print Monday's BUY/SELL orders for the 20-stock Carver portfolio")
-    ap.add_argument("--timeframe", "-t", choices=["W", "M"], default="W", help="W=weekly (default), M=monthly")
+    ap = argparse.ArgumentParser(description="Print next session's BUY/SELL orders for the 20-stock Carver portfolio")
+    ap.add_argument("--timeframe", "-t", choices=["W", "M"], default=TIMEFRAME,
+                    help=f"M=monthly, W=weekly (default {TIMEFRAME})")
     ap.add_argument("--portfolio", default="my_portfolio.csv")
     ap.add_argument("--max-pos", type=int, default=MAX_POSITIONS)
     ap.add_argument("--capital", type=float, default=CAPITAL,
@@ -149,7 +153,7 @@ def main() -> None:
     ap.add_argument("--monthly-limit", type=float, default=MONTHLY_LIMIT,
                     help="max new buying per calendar month (default: no limit)")
     ap.add_argument("--any-at-20", action="store_true",
-                    help="also buy stocks that were already at 20 last week (default: fresh crosses only)")
+                    help="also buy stocks that were already at 20 on the previous bar (default: fresh crosses only)")
     ap.add_argument("--entry", type=float, default=20.0)
     ap.add_argument("--exit", type=float, default=19.0)
     ap.add_argument("--cost", type=float, default=0.15, help="cost per side in %% used for cash estimates")
@@ -210,7 +214,11 @@ def main() -> None:
     room = max(args.capital - invested_after_sells, 0.0)          # capital cap
     budget = room if cash is None else min(room, cash + sale_proceeds)
 
-    exec_day = (pd.Timestamp(bar_date) + pd.offsets.BDay(1)).date()
+    bar_end = pd.Timestamp(bar_date)
+    bar_end = bar_end if bar_end.weekday() < 5 else bar_end - pd.offsets.BDay(1)
+    ref = pd.Timestamp(now.date() if now.time() >= dt.time(9, 15) else now.date() - dt.timedelta(days=1))
+    exec_day = (max(bar_end, ref) + pd.offsets.BDay(1)).date()
+    late = exec_day > (bar_end + pd.offsets.BDay(1)).date()
     month_spent = 0.0
     if "BuyDate" in hold:
         bd = pd.to_datetime(hold["BuyDate"], errors="coerce")
@@ -252,13 +260,13 @@ def main() -> None:
 
     # ---- report -----------------------------------------------------------
     label = TF_NAME[tf]
-    when = "Monday's" if tf == "W" else "next session's"
+    when = f"the {exec_day:%a %d %b} (next session)"
     print("=" * 78)
     print(f" CARVER {label.upper()} ORDERS  --  signals from the bar closing {bar_date}, execute at {when} open")
     print(f" Generated {now:%Y-%m-%d %H:%M} IST   |   max {args.max_pos} positions")
     print("=" * 78)
     print(f" Capital cap     : ₹{args.capital:,.0f}   ->  slot size ₹{slot:,.0f} (1/{args.max_pos})")
-    print(f" Holdings        : ₹{hold_value:,.0f} at Friday close (₹{hold['CostValue'].sum():,.0f} at cost)"
+    print(f" Holdings        : ₹{hold_value:,.0f} at last close (₹{hold['CostValue'].sum():,.0f} at cost)"
           + ("" if cash is None else f",  cash in account ₹{cash:,.0f}"))
     print(f" Room under cap  : ₹{room:,.0f} after sells")
     if month_left is not None:
@@ -282,12 +290,12 @@ def main() -> None:
     elif free <= 0:
         print("  portfolio is full")
     else:
-        print(f"  no fresh cross to +{args.entry:g} this week -- nothing to buy")
+        print(f"  no fresh cross to +{args.entry:g} on this bar -- nothing to buy")
     if missed:
         print(f"  Signals NOT taken ({len(missed)}): {', '.join(missed[:12])}")
     if not args.any_at_20:
         n_old = int((at_entry & ~fresh_mask).sum())
-        print(f"  ({n_old} other stocks are at 20 but were already there last week -- ignored)")
+        print(f"  ({n_old} other stocks are at 20 but were already there on the previous bar -- ignored)")
 
     print(f"\n--- HOLD ({len(keep)}) ---")
     if len(keep):
@@ -296,6 +304,9 @@ def main() -> None:
         print(t[["Symbol", "Qty", "BuyPrice", "Close", "P&L%", "Forecast", "Note"]].round(2)
               .sort_values("Forecast").to_string(index=False))
 
+    if late:
+        print(f"\n!! Running late: this signal was for the {(bar_end + pd.offsets.BDay(1)):%d %b} open. "
+              f"Place the orders at the next open anyway (prices may have moved).")
     if len(unknown):
         print(f"\n!! No price data for: {', '.join(unknown['Symbol'])} -- check the symbols in {args.portfolio}")
     if len(stale):
@@ -304,7 +315,7 @@ def main() -> None:
     if bar_date < (now.date() - dt.timedelta(days=10 if tf == 'W' else 40)):
         print("\n!! Latest closed bar looks old -- Yahoo data may be delayed; re-run later.")
 
-    print("\nNotes: quantities use Friday's close; place LIMIT or market orders at the open and")
+    print("\nNotes: quantities use the last close; place LIMIT or market orders at the open and")
     print("update your portfolio file with the real fills. Signals are valid until the next close.")
 
     stamp = f"{bar_date:%Y-%m-%d}"
