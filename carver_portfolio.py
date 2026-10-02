@@ -11,6 +11,7 @@ simulates a real account with a maximum number of positions:
               (--fresh-only: only if it was below 20 on the bar before)
     * EXIT  : forecast <  19 at a bar's close                    -> sell next open
     * sells are done before buys, so a freed slot can be reused the same day
+    * --once per-stock: never buy the same stock twice; --once first-ever: only its first-ever touch of 20
     * when more stocks qualify than there are free slots, they are ranked by:
         strength : strongest trend first (uncapped forecast)       [default]
         lowvol   : lowest annualised volatility first
@@ -52,9 +53,19 @@ def build_panel(stocks: dict[str, pd.DataFrame], tf: str, p: Params) -> dict[str
 
 def simulate(panel: dict[str, pd.DataFrame], start: pd.Timestamp, max_pos: int, entry: float,
              exit_: float, cost: float, rank: str, cash_rate: float, per_year: int,
-             seed: int = 0, fresh_only: bool = False) -> tuple[pd.DataFrame, pd.DataFrame]:
+             seed: int = 0, fresh_only: bool = False, once: str = "no") -> tuple[pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(seed)
     dates = panel["close"].index[panel["close"].index >= start]
+    # once="first-ever": the date each stock's forecast FIRST reached the entry level in its whole history
+    full_f = panel["fc"]
+    first_touch = (full_f >= entry - 1e-9).idxmax().where((full_f >= entry - 1e-9).any())
+    first_touch = first_touch.reindex(panel["close"].columns)
+    is_first = np.zeros((len(dates), len(panel["close"].columns)), dtype=bool)
+    pos = {d: i for i, d in enumerate(dates)}
+    for j, d in enumerate(first_touch.to_numpy()):
+        if pd.notna(d) and pd.Timestamp(d) in pos:
+            is_first[pos[pd.Timestamp(d)], j] = True
+    traded = np.zeros(len(panel["close"].columns), dtype=bool)  # once="per-stock"
     syms = np.array(panel["close"].columns)
     O = panel["open"].loc[dates].to_numpy()
     C = panel["close"].loc[dates].ffill().to_numpy()   # last known close for marking
@@ -93,6 +104,7 @@ def simulate(panel: dict[str, pd.DataFrame], start: pd.Timestamp, max_pos: int, 
             if alloc < slot_value * 0.5:   # not enough cash for a meaningful position
                 continue
             shares[j] = alloc / (O[t, j] * (1 + cost))
+            traded[j] = True
             cash -= alloc
             entry_info[j] = (d, O[t, j], F[t - 1, j] if t else np.nan)
         to_buy = []
@@ -111,6 +123,10 @@ def simulate(panel: dict[str, pd.DataFrame], start: pd.Timestamp, max_pos: int, 
             if fresh_only:  # only stocks that crossed up to the entry level on THIS bar
                 prev = F[t - 1] if t else np.full(len(syms), np.nan)
                 ok &= ~(prev >= entry - 1e-9)
+            if once == "per-stock":   # never buy a stock a second time
+                ok &= ~traded
+            elif once == "first-ever":  # only on the first-ever touch of 20
+                ok &= is_first[t]
             cand = np.where(ok)[0]
             if len(cand):
                 if rank == "strength":
@@ -157,6 +173,9 @@ def main() -> None:
     ap.add_argument("--fresh-only", action="store_true",
                     help="buy only stocks that crossed up to the entry level on the latest bar "
                          "(default: any stock currently at the entry level)")
+    ap.add_argument("--once", choices=["no", "per-stock", "first-ever"], default="no",
+                    help="per-stock: buy each stock at most once (no repeat trades); "
+                         "first-ever: buy only on the first time its forecast EVER reached 20")
     ap.add_argument("--rank", choices=["strength", "lowvol", "random"], default="strength",
                     help="which stocks to buy when more qualify than free slots")
     ap.add_argument("--runs", type=int, default=1, help="with --rank random: number of random runs")
@@ -187,13 +206,14 @@ def main() -> None:
     for k in range(runs):
         curve, trades = simulate(panel, start, args.max_pos, args.entry, args.exit, args.cost / 100,
                                  args.rank, args.cash_rate, per_year, seed=args.seed + k,
-                                 fresh_only=args.fresh_only)
+                                 fresh_only=args.fresh_only, once=args.once)
         results[f"run {k + 1}" if runs > 1 else "Strategy"] = summarize(curve, trades, bench_close, per_year)
         last = (curve, trades)
     curve, trades = last
 
     print(f"##### {TF_NAME[tf]}, max {args.max_pos} positions, rank={args.rank}, "
-          f"entries={'fresh crosses only' if args.fresh_only else 'any stock at 20'}, "
+          f"entries={'fresh crosses only' if args.fresh_only else 'any stock at 20'}"
+          f"{'' if args.once == 'no' else ', once=' + args.once}, "
           f"cost {args.cost}%/side, cash {args.cash_rate}%/yr #####")
     print(f"Period: {curve.index[0]:%Y-%m-%d} to {curve.index[-1]:%Y-%m-%d}\n")
     table = pd.DataFrame(results)
