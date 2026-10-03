@@ -1,11 +1,12 @@
 """
-Backtest: NIFTY weekly options "premium doubling" momentum buy on expiry days.
+Backtest: NIFTY weekly options "premium doubling" momentum buy.
 
 Rules
 -----
-ENTRY  : on an expiry day, a 1-min candle whose close is >= 2x the previous
-         1-min candle's close (premium doubles in one candle), AND the entry
-         premium (that candle's close) is between 20 and 50. Buy at that close.
+ENTRY  : a 1-min candle whose close is >= 2x the previous 1-min candle's close
+         (premium doubles in one candle), any premium. Buy at that close.
+         Every trading day is tested, using the current-week (nearest) expiry.
+         Optional filters: --min-prem/--max-prem, --expiry-only.
 EXIT 1 : TARGET - premium reaches 200 (candle high >= 200 -> filled at 200).
 EXIT 2 : a 1-min candle closes below the 10 EMA of the option's close.
 STOP   : low of the candle before the entry candle (hit if a candle's low <= SL).
@@ -46,9 +47,9 @@ def load_expiry(path, ema_len):
     return d
 
 
-def run_day(day, cfg):
+def run_day(day, trading_day, cfg):
     expiry = day["expiry"].iloc[0]
-    day = day[day["trading_day"] == expiry].copy()
+    day = day[day["trading_day"] == trading_day].copy()
     if day.empty:
         return []
 
@@ -56,7 +57,7 @@ def run_day(day, cfg):
     day["jump"] = jump
     sig = day[
         (day["jump"] >= cfg.mult)
-        & (day["prev_day"] == expiry)  # previous candle must be same day (no overnight gap)
+        & (day["prev_day"] == trading_day)  # previous candle must be same day (no overnight gap)
         & (day["close"] >= cfg.min_prem)
         & (day["close"] <= cfg.max_prem)
         & (day["timestamp"].dt.strftime("%H:%M") <= cfg.last_entry)
@@ -94,6 +95,7 @@ def run_day(day, cfg):
         gross = pts * lot_size * cfg.lots
         trades.append(
             dict(
+                date=trading_day,
                 expiry=expiry,
                 contract=f"NIFTY {int(s['strike'])} {s['option_type']}",
                 entry_time=ts.strftime("%H:%M"),
@@ -119,8 +121,9 @@ def main():
     p.add_argument("--mult", type=float, default=2.0, help="candle close / reference >= mult")
     p.add_argument("--basis", choices=["prev_close", "open"], default="prev_close",
                    help="'doubles' measured vs previous candle close or same candle open")
-    p.add_argument("--min-prem", type=float, default=20)
-    p.add_argument("--max-prem", type=float, default=50)
+    p.add_argument("--min-prem", type=float, default=0)
+    p.add_argument("--max-prem", type=float, default=float("inf"))
+    p.add_argument("--expiry-only", action="store_true", help="trade only on expiry days")
     p.add_argument("--target", type=float, default=200)
     p.add_argument("--ema", type=int, default=10)
     p.add_argument("--lot-size", type=int, default=0, help="0 = auto (75 before 2026, 65 from 2026)")
@@ -131,18 +134,27 @@ def main():
     p.add_argument("--out", default="results/trades.csv")
     cfg = p.parse_args()
 
+    # Expiry files needed: any expiry from the start date up to the first one after the end date.
     files = sorted(glob.glob(os.path.join(DATA_DIR, "*.parquet")))
-    files = [f for f in files if cfg.start <= os.path.basename(f)[:10] <= cfg.end]
+    expiries = [os.path.basename(f)[:10] for f in files]
+    files = [f for f, e in zip(files, expiries)
+             if e >= cfg.start and (e <= cfg.end or e == min([x for x in expiries if x > cfg.end], default=None))]
     if not files:
         raise SystemExit("No data found - run download_data.py first.")
 
-    trades = []
-    for f in files:
-        trades += run_day(load_expiry(f, cfg.ema), cfg)
+    data = {os.path.basename(f)[:10]: load_expiry(f, cfg.ema) for f in files}
+    days = sorted({t for d in data.values() for t in d["trading_day"].unique() if cfg.start <= t <= cfg.end})
+    trades, tested = [], []
+    for day in days:
+        expiry = min((e for e in data if e >= day), default=None)  # current-week contract
+        if expiry is None or (cfg.expiry_only and day != expiry):
+            continue
+        tested.append(day)
+        trades += run_day(data[expiry], day, cfg)
 
     t = pd.DataFrame(trades)
     pd.set_option("display.width", 250, "display.max_columns", 50)
-    print(f"Expiry days tested: {', '.join(os.path.basename(f)[:10] for f in files)}\n")
+    print(f"Days tested ({len(tested)}): {', '.join(tested)}\n")
     if t.empty:
         print("No trades.")
         return
@@ -160,8 +172,8 @@ def main():
     print(f"Net P&L       : Rs {t.net_pnl.sum():,.0f}  (after ~Rs {cfg.charges:.0f}/trade charges)")
     print(f"Avg win / loss: Rs {wins.net_pnl.mean() if len(wins) else 0:,.0f} / "
           f"Rs {t[t.net_pnl <= 0].net_pnl.mean() if (t.net_pnl <= 0).any() else 0:,.0f}")
-    print("\nPer expiry:")
-    print(t.groupby("expiry").agg(trades=("net_pnl", "size"), net_pnl=("net_pnl", "sum")).to_string())
+    print("\nPer day:")
+    print(t.groupby("date").agg(trades=("net_pnl", "size"), net_pnl=("net_pnl", "sum")).to_string())
 
 
 if __name__ == "__main__":
