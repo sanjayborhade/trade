@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+data/raw/*
+!data/raw/PUT_YOUR_CSV_FILES_HERE.txt
+data/cache/
+results/*
+!results/.gitkeep
+.pytest_cache/

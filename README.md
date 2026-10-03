@@ -5,6 +5,8 @@ Research, four objective intraday strategies for NSE, and a backtest/risk toolki
 
 ## What's inside
 
+> **New: [`intraday_backtester/`](intraday_backtester/README.md)** is a production backtesting system for your own Nifty 500 **1-minute** data. It includes a realistic portfolio, Indian costs, look-ahead tests, development/validation/test periods, walk-forward and robust optimisation. Start with its README.
+
 | File | What it is |
 |---|---|
 | **`STRATEGIES.md`** | **Start here.** One-page cards for the 4 strategies (A–D): exact entry, stop, exit, sizing and when not to trade |

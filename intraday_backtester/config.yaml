@@ -1,0 +1,188 @@
+# =============================================================================
+#  Intraday Backtester - configuration
+#  Edit this file instead of the Python code. Paths are relative to this file.
+#  Fractions: 0.005 = 0.5 %.   Times: "HH:MM" IST.
+# =============================================================================
+
+data:
+  # Windows paths: use forward slashes "E:/STUDY/nifty500" or single quotes 'E:\STUDY\nifty500'
+  DATA_FOLDER: "data/raw"            # your 1-minute CSV files (sub-folders are searched too)
+  CACHE_FOLDER: "data/cache"         # cleaned Parquet cache created by prepare_data.py
+  file_pattern: "*.csv"              # e.g. "*.csv" or "*_1min.csv"
+
+  # Where the stock symbol comes from:
+  #   auto     -> a Symbol/Ticker column if present, otherwise the file name
+  #   column   -> always the column     filename -> always the file name
+  symbol_from: "auto"
+  strip_prefixes: ["NSE_", "NSE:", "NSE-"]           # removed from file names / symbols
+  strip_suffixes: ["_1MIN", "_1M", "-1MIN", "_MINUTE", "-EQ", "_EQ", ".NS", "_NSE", "-NSE"]
+
+  # Candidate column names (case, spaces and symbols are ignored when matching).
+  columns:
+    datetime: [datetime, date_time, timestamp, time_stamp, datetime_ist, dt]
+    date:     [date, trade_date, tradedate, day]
+    time:     [time, trade_time, tradetime, minute]
+    open:     [open, o, open_price, openprice]
+    high:     [high, h, high_price, highprice]
+    low:      [low, l, low_price, lowprice]
+    close:    [close, c, close_price, closeprice, ltp, last]
+    volume:   [volume, vol, v, qty, quantity, traded_qty, tradedqty, volume_traded]
+    symbol:   [symbol, ticker, tradingsymbol, trading_symbol, scrip, stock, name, instrument]
+
+  datetime_format: null              # e.g. "%Y-%m-%d %H:%M:%S"; null = auto-detect
+  dayfirst: true                     # "05-01-2024" means 5 Jan 2024 (Indian convention)
+  timezone: "Asia/Kolkata"           # timestamps with a time zone are converted to IST
+  # Some vendors stamp a candle with its END time (09:16 for 09:15-09:16).
+  # auto = detect from the data (first candle 09:16 and a 15:30 candle => end-stamped)
+  timestamp_is_bar_end: "auto"       # auto | true | false
+
+  session_start: "09:15"
+  session_end: "15:30"               # candles starting at/after this are dropped
+  min_bars_per_day: 300              # a full NSE day has 375 one-minute candles
+  exclude_short_days: true           # skip days with fewer candles (half days, bad data)
+  duplicate_policy: "last"           # last | first  (which copy of a duplicate timestamp to keep)
+  ohlc_policy: "repair"              # repair (fix high/low to contain open/close) | drop
+  max_minute_jump_pct: 15            # 1-minute moves larger than this are reported as suspicious
+  corporate_action_gap_pct: 25       # overnight gaps larger than this = likely split/bonus (unadjusted data)
+  ca_exclusion_days: 20              # do not trade a stock for this many days after such a gap
+  big_file_mb: 500                   # CSVs larger than this are read in chunks
+  chunksize: 2000000
+  workers: 0                         # parallel processes; 0 = CPU cores - 1
+
+benchmarks:
+  # Optional 1-minute index files in the same CSV format (strongly recommended).
+  NIFTY50_FILE: null                 # e.g. "data/index/NIFTY50.csv"
+  NIFTY500_FILE: null                # e.g. "data/index/NIFTY500.csv"
+  build_equal_weight: true           # build an equal-weight index from your stocks (fallback benchmark)
+  regime_benchmark: "auto"           # auto (NIFTY50 file if given, else equal-weight) | nifty50 | nifty500 | universe
+
+universe:
+  # Optional CSV with columns symbol,start_date,end_date giving historical Nifty 500
+  # membership. Without it the backtest uses TODAY's list for the past = survivorship bias.
+  MEMBERSHIP_FILE: null
+  mode: "all"                        # all | liquid   (CLI --universe overrides)
+  min_price: 50                      # previous close, rupees
+  max_price: 100000
+  min_avg_daily_volume: 0            # shares, average of previous N days
+  min_avg_traded_value: 50000000     # rupees (5 crore), average of previous N days
+  liquidity_lookback_days: 20
+  min_trading_days: 60               # history a stock needs before it can be traded
+
+portfolio:
+  INITIAL_CAPITAL: 1000000
+  RISK_PER_TRADE: 0.005              # 0.5 % of equity risked per trade (stop distance x qty)
+  MAX_OPEN_POSITIONS: 5
+  MAX_DAILY_LOSS: 0.015              # stop opening trades when today's realised loss + open risk would exceed 1.5 %
+  daily_loss_mode: "realized_plus_open_risk"   # realized | realized_plus_open_risk
+  MAX_DAILY_TRADES: 10
+  MAX_PORTFOLIO_EXPOSURE: 1.0        # total position value / equity. 1.0 = no leverage (MIS allows up to ~5)
+  MAX_POSITION_VALUE_PCT: 0.25       # one position <= 25 % of equity
+  MAX_POSITION_VALUE_ABS: null       # optional rupee cap per position
+  MAX_PARTICIPATION: 0.05            # quantity <= 5 % of the fill candle's volume (partial-fill model)
+  sizing_equity: "current"           # current (compounding) | initial (fixed rupee risk)
+  allow_short: true                  # intraday (MIS) shorting of cash equities
+  ranking: "score"                   # simultaneous signals: score (strategy strength) | random | symbol
+  random_seed: 42
+
+costs:
+  # Equity INTRADAY (MIS) on NSE. Check your broker's contract note and edit.
+  BROKERAGE_PCT: 0.0003              # 0.03 % of order value ...
+  BROKERAGE_MAX_PER_ORDER: 20        # ... or Rs 20 per executed order, whichever is lower
+  STT: 0.00025                       # 0.025 % on the SELL side only
+  EXCHANGE_CHARGES: 0.0000307        # NSE transaction charge, both sides
+  SEBI_CHARGES: 0.000001             # Rs 10 per crore, both sides
+  STAMP_DUTY: 0.00003                # 0.003 % on the BUY side only
+  GST: 0.18                          # 18 % on (brokerage + exchange + SEBI charges)
+  IPFT: 0.0                          # NSE investor-protection charge if your note shows it separately
+  SLIPPAGE: 0.0005                   # per side, fraction of price (0.0001 = 0.01 %, 0.0005 = 0.05 %)
+  SPREAD: 0.0004                     # full bid-ask spread estimate; HALF is paid on each market/stop fill
+
+execution:
+  same_bar_stop_target: "stop_first" # if stop and target are both inside one candle: stop_first (conservative) | target_first
+  trade_through_ticks: 1             # stop/limit orders need price to go this many ticks beyond the level
+  tick_size: 0.05
+  square_off_time: "15:15"           # positions closed at the open of the first candle at/after this time
+  order_validity_minutes: 30         # default lifetime of stop/limit entry orders (strategies may override)
+
+regimes:
+  trend_fast_days: 20                # benchmark SMA lengths for bull / bear / sideways (prior days only)
+  trend_slow_days: 50
+  vol_lookback_days: 20              # realised volatility window
+  vol_rank_days: 250                 # high / low volatility = above / below the median of this window
+  gap_threshold_pct: 1.0             # stock gap-up / gap-down threshold
+  high_volume_ratio: 1.5             # cumulative volume vs. normal for that time of day
+  low_volume_ratio: 0.7
+  expiry_rules:                      # weekly Nifty expiry weekday by period (0=Mon ... 3=Thu)
+    - {from: "2000-01-01", weekday: 3}
+    - {from: "2025-09-01", weekday: 1}
+
+periods:
+  # Development / validation / out-of-sample split of YOUR actual date range.
+  mode: "fractions"                  # fractions | dates
+  fractions: [0.6, 0.2, 0.2]
+  dates:
+    development: ["2019-01-01", "2023-12-31"]
+    validation:  ["2024-01-01", "2025-06-30"]
+    test:        ["2025-07-01", "2026-12-31"]
+
+walk_forward:
+  train_months: 24
+  test_months: 6
+  step_months: 6
+
+optimization:
+  min_trades: 100                    # parameter sets with fewer development trades are not ranked
+  batch_size: 8                      # parameter sets evaluated per pass over the data (memory vs speed)
+  top_n_validate: 5
+
+analysis:
+  bootstrap_samples: 2000
+  top_symbols_concentration: 5
+
+output:
+  OUTPUT_FOLDER: "results"
+  save_parquet: true
+  charts: true
+
+# -----------------------------------------------------------------------------
+# Strategy parameters. Anything omitted uses the strategy's default
+# (see `python backtest.py --list`). `optimize` lists the grid used by optimize.py.
+# These defaults come from the research notes - they are NOT optimised.
+# -----------------------------------------------------------------------------
+strategies:
+  orb:
+    params: {or_minutes: 15, entry_type: "stop", stop_mode: "or", target_r: 2.0, volume_mult: 0.0,
+             trailing: "none", entry_cutoff: "11:30"}
+    optimize:
+      or_minutes: [5, 15, 30]
+      stop_atr: [0.5, 1.0, 1.5, 2.0]
+      target_r: [1.0, 1.5, 2.0, 3.0]
+      volume_mult: [1.0, 1.5, 2.0]
+    optimize_fixed: {stop_mode: "atr", entry_type: "close"}
+  vwap_momentum:
+    params: {}
+    optimize: {lookback: [10, 15, 30], target_r: [1.5, 2.0, 3.0], volume_mult: [1.0, 1.5]}
+  trend_pullback:
+    params: {}
+    optimize: {adx_min: [20, 25, 30], target_r: [1.5, 2.0, 3.0]}
+  relative_strength:
+    params: {}
+    optimize: {rs_min_pct: [0.5, 1.0, 1.5], stop_atr: [0.5, 1.0], target_r: [1.5, 2.0, 3.0]}
+  failed_breakout:
+    params: {}
+    optimize: {breach_atr: [0.05, 0.1, 0.2], window_minutes: [15, 30, 60], min_rr: [1.0, 1.5]}
+  nr7_breakout:
+    params: {}
+    optimize: {level_mult: [0.3, 0.5, 0.7], stop_atr: [0.3, 0.5, 1.0]}
+  first_candle_breakout:
+    params: {candle_minutes: 5, min_gain_pct: 3.0, max_gain_pct: 10.0}
+    optimize: {candle_minutes: [5, 15], min_gain_pct: [2.0, 3.0, 4.0], target_r: [0.0, 2.0, 3.0]}
+  pdh_breakout:
+    params: {}
+    optimize: {volume_mult: [1.0, 1.5, 2.0], stop_atr: [0.5, 1.0], target_r: [1.5, 2.0, 3.0]}
+  gap_reversal:
+    params: {}
+    optimize: {gap_min_pct: [1.0, 1.5, 2.0], or_minutes: [15, 30], min_rr: [1.0, 1.5]}
+  vwap_reversion:
+    params: {}
+    optimize: {dev_atr: [0.4, 0.6, 0.8], rsi_extreme: [75, 80, 85]}
