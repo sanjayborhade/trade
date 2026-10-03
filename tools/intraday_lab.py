@@ -255,8 +255,21 @@ def load_csv(path: str) -> List[Bar]:
     ISO / dd-mm-yyyy / epoch timestamps, tz-aware times (converted to IST)
     and ignores extra columns such as indicators. 1-minute data is
     resampled to 5-minute automatically."""
-    with open(path, newline="", encoding="utf-8-sig") as f:
+    if not os.path.isfile(path):
+        raise SystemExit(f"\nFile not found (or it is a folder): {path}\n"
+                         f"  Check the path; put it in double quotes if it contains spaces.")
+    try:
+        f = open(path, newline="", encoding="utf-8-sig")
         sample = f.read(4096)
+    except PermissionError:
+        raise SystemExit(
+            f"\nWindows refused to read {path} (Permission denied).\n"
+            f"  Most likely the file is OPEN IN EXCEL, which locks CSV files. Close it and re-run.\n"
+            f"  Otherwise: make it available offline in Google Drive/OneDrive, or copy it to a local folder.")
+    except UnicodeDecodeError:
+        f = open(path, newline="", encoding="latin-1")
+        sample = f.read(4096)
+    with f:
         f.seek(0)
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
