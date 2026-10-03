@@ -10,7 +10,9 @@ Research, four objective intraday strategies for NSE, and a backtest/risk toolki
 | **`STRATEGIES.md`** | **Start here.** One-page cards for the 4 strategies (A–D): exact entry, stop, exit, sizing and when not to trade |
 | `research/indian_intraday_playbook.md` | Full research: 5 documented traders, Indian market adaptation (2026 costs and rules), backtest framework, risk maths, regime matrix, playbook, decision tree, sources |
 | `tools/intraday_lab.py` | Cost calculator, position sizing, loss-streak/drawdown maths, backtester for the 4 strategies |
-| `tools/fetch_yahoo.py` | Downloads the last ~60 days of 5-minute Nifty / Bank Nifty / stock candles into `data/` |
+| `tools/fetch_yahoo.py` | Downloads the last ~60 days of 5-minute candles into `data/` (`--nifty500` for all Nifty 500 stocks) |
+| `tools/orb_first_candle.py` | Backtester for the **first 5-minute candle breakout** (3–10% gainers) on a stock universe |
+| `research/backtest_first_candle_orb.md` | **Results: first-candle breakout on Nifty 500, Jul–Sep 2026** |
 | `research/backtest_results_2026-09.md` | **Results: 1-month (Sep 2026) backtest of all 4 strategies** |
 | `templates/daily_checklist.md` | Printable pre-market → post-market checklist |
 | `templates/trade_journal.csv` | Journal template (open in Excel / Google Sheets) |
@@ -53,3 +55,12 @@ Research, four objective intraday strategies for NSE, and a backtest/risk toolki
 | `--lots` | Always trade exactly N lots (ignores capital/risk sizing) |
 
 Costs use the post-1-April-2026 STT schedule. Edit `RATES` at the top of `tools/intraday_lab.py` if your broker's charges differ.
+
+## First-candle breakout on Nifty 500
+
+```bash
+python3 tools/fetch_yahoo.py --nifty500                      # ~1 minute, about 115 MB
+python3 tools/orb_first_candle.py --data data --variants      # all Nifty 500 stocks
+python3 tools/orb_first_candle.py --data data --start 2026-09-01 --min-gain 3 --max-gain 10
+```
+Options: `--capital`, `--risk`, `--slippage` (% per side), `--last-entry 14:30`, `--max-per-day 3`, `--out trades.csv`.
