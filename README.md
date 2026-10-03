@@ -28,7 +28,7 @@ Research, four objective intraday strategies for NSE, and a backtest/risk toolki
 
 ## Backtest on your own data
 
-1. Export **5-minute** candles from your broker or data vendor to CSV with this header:
+1. Export **5-minute or 1-minute** candles (1-minute is auto-converted to 5-minute) from your broker, TradingView or a data vendor. Column names are detected automatically: `Date`/`Time`/`Timestamp`/`datetime`, `Open`/`High`/`Low`/`Close`/`Volume` in any case, separate date and time columns, ISO, dd-mm-yyyy or epoch times. Extra indicator columns are ignored. The standard header is:
    `datetime,open,high,low,close,volume` (e.g. `2026-01-05 09:15:00,26150,26180,26120,26170,123456`).
    Use at least 2–5 years, IST times, sorted oldest first.
 2. Run:

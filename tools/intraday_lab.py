@@ -31,7 +31,7 @@ import random
 import statistics
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time, timedelta, timezone
 from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -204,13 +204,152 @@ class Config:
     trades: List[Trade] = field(default_factory=list)
 
 
+_ALIASES = {
+    "datetime": ["datetime", "date_time", "timestamp", "time_stamp", "date", "datetime_ist", "time"],
+    "open": ["open", "o", "open_price"],
+    "high": ["high", "h", "high_price"],
+    "low": ["low", "l", "low_price"],
+    "close": ["close", "c", "close_price", "ltp", "last"],
+    "volume": ["volume", "vol", "v", "qty", "traded_qty", "volume_traded"],
+}
+_DT_FORMATS = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M",
+               "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M",
+               "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%d-%b-%Y %H:%M:%S", "%d-%b-%Y %H:%M",
+               "%Y%m%d %H:%M:%S", "%Y%m%d %H:%M"]
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _norm(name: str) -> str:
+    return name.strip().lstrip("\ufeff").strip('"').lower().replace(" ", "_")
+
+
+def _parse_dt(text: str) -> datetime:
+    t = text.strip().strip('"')
+    if t.isdigit() and len(t) >= 10:  # unix epoch seconds or milliseconds
+        sec = int(t) / (1000 if len(t) >= 13 else 1)
+        return datetime.fromtimestamp(sec, _IST).replace(tzinfo=None)
+    try:
+        dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+    except ValueError:
+        dt = None
+        for fmt in _DT_FORMATS:
+            try:
+                dt = datetime.strptime(t, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            raise ValueError(f"unrecognised date/time format: {text!r}")
+    if dt.tzinfo is not None:  # e.g. 2024-01-01T09:15:00+05:30 or UTC -> IST, drop tz
+        dt = dt.astimezone(_IST).replace(tzinfo=None)
+    return dt
+
+
+def _num(x: str) -> float:
+    return float(x.replace(",", "").strip().strip('"')) if x and x.strip() else 0.0
+
+
 def load_csv(path: str) -> List[Bar]:
-    out = []
-    with open(path) as f:
-        for row in csv.DictReader(f):
-            out.append(Bar(datetime.fromisoformat(row["datetime"]), float(row["open"]),
-                           float(row["high"]), float(row["low"]), float(row["close"]),
-                           float(row.get("volume") or 0)))
+    """Load OHLCV bars. Accepts common header variants (Date/Time/Timestamp,
+    Open/High/Low/Close/Volume in any case), separate date + time columns,
+    ISO / dd-mm-yyyy / epoch timestamps, tz-aware times (converted to IST)
+    and ignores extra columns such as indicators. 1-minute data is
+    resampled to 5-minute automatically."""
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.reader(f, dialect)
+        header = next(reader)
+        cols = {_norm(h): i for i, h in enumerate(header)}
+
+        def find(key: str) -> Optional[int]:
+            for a in _ALIASES[key]:
+                if a in cols:
+                    return cols[a]
+            return None
+
+        idx = {k: find(k) for k in ("open", "high", "low", "close", "volume")}
+        date_i = cols.get("date")
+        time_i = cols.get("time")
+        dt_i = None
+        for a in ("datetime", "date_time", "timestamp", "time_stamp", "datetime_ist"):
+            if a in cols:
+                dt_i = cols[a]
+                break
+        if dt_i is None and date_i is None and time_i is not None:
+            dt_i = time_i  # single "time" column holding full timestamps
+        missing = [k for k in ("open", "high", "low", "close") if idx[k] is None]
+        if missing or (dt_i is None and date_i is None):
+            raise SystemExit(
+                f"\nCould not find required columns in {path}.\n"
+                f"  Columns found : {header}\n"
+                f"  Need          : a date/time column (datetime, timestamp, date [+ time]) "
+                f"and open, high, low, close (volume optional).\n"
+                f"  Missing       : {missing + ([] if dt_i is not None or date_i is not None else ['datetime'])}\n"
+                f"  Rename the headers in Excel, or ask for an alias to be added.")
+
+        out: List[Bar] = []
+        bad = 0
+        for row in reader:
+            if not row or all(not c.strip() for c in row):
+                continue
+            try:
+                if dt_i is not None:
+                    dt = _parse_dt(row[dt_i])
+                elif time_i is not None:
+                    dt = _parse_dt(f"{row[date_i].strip()} {row[time_i].strip()}")
+                else:
+                    dt = _parse_dt(row[date_i])
+                vol = _num(row[idx["volume"]]) if idx["volume"] is not None else 0.0
+                out.append(Bar(dt, _num(row[idx["open"]]), _num(row[idx["high"]]),
+                               _num(row[idx["low"]]), _num(row[idx["close"]]), vol))
+            except (ValueError, IndexError):
+                bad += 1
+        if bad:
+            print(f"  note: skipped {bad} unreadable row(s) in {path}")
+    if not out:
+        raise SystemExit(f"No usable rows in {path}.")
+    out.sort(key=lambda b: b.dt)
+    # keep regular NSE session only
+    out = [b for b in out if time(9, 15) <= b.dt.time() < time(15, 30)]
+    if not out:
+        raise SystemExit("No rows between 09:15 and 15:30 IST. Are timestamps in IST (or tz-aware)?")
+    step = _bar_minutes(out)
+    if step >= 24 * 60 or step == 0:
+        raise SystemExit("This looks like DAILY data. The backtester needs intraday (1- or 5-minute) candles.")
+    if step < 5:
+        print(f"  note: {step}-minute data detected -> resampled to 5-minute bars")
+        out = _resample(out, 5)
+    elif step > 5:
+        print(f"  note: {step}-minute bars detected. Strategies were designed for 5-minute bars; "
+              f"results will differ.")
+    print(f"  loaded {len(out):,} bars, {out[0].dt:%Y-%m-%d} to {out[-1].dt:%Y-%m-%d}")
+    return out
+
+
+def _bar_minutes(bars: List[Bar]) -> int:
+    diffs = {}
+    for a, b in zip(bars, bars[1:]):
+        if a.dt.date() == b.dt.date():
+            m = int((b.dt - a.dt).total_seconds() // 60)
+            diffs[m] = diffs.get(m, 0) + 1
+    return max(diffs, key=diffs.get) if diffs else 24 * 60
+
+
+def _resample(bars: List[Bar], minutes: int) -> List[Bar]:
+    out: List[Bar] = []
+    for b in bars:
+        mins = (b.dt.hour * 60 + b.dt.minute - 555) // minutes * minutes + 555  # anchor 09:15
+        key = b.dt.replace(hour=mins // 60, minute=mins % 60, second=0, microsecond=0)
+        if out and out[-1].dt == key:
+            o = out[-1]
+            o.h, o.l, o.c, o.v = max(o.h, b.h), min(o.l, b.l), b.c, o.v + b.v
+        else:
+            out.append(Bar(key, b.o, b.h, b.l, b.c, b.v))
     return out
 
 
@@ -603,7 +742,8 @@ def main(argv: List[str]) -> None:
                                           for k, v in res.items()})
         if res.get("trades", 0) == 0:
             print("    0 trades: no setup qualified, OR one lot's risk exceeded your budget / the "
-                  "cost filter. Try --instrument stock, a larger --capital, or check data.")
+                  "cost filter. Try --instrument stock, a larger --capital, or check data "
+                  "(needs 15+ trading days: daily ATR uses the previous 14 days).")
         if a.command == "trades":
             _write_trades(a.out, [t for t in cfg.trades if t.exit_time], s)
     if a.command == "trades":
