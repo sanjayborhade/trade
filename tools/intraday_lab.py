@@ -31,7 +31,7 @@ import random
 import statistics
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Dict, List, Optional
 
 # ---------------------------------------------------------------------------
@@ -168,40 +168,69 @@ class Bar:
 @dataclass
 class Trade:
     day: str
-    side: int          # +1 long, -1 short
+    side: int              # +1 long, -1 short
     entry_time: str
     entry: float
-    stop: float
-    exit_time: str = ""
-    exit: float = 0.0
+    stop: float            # initial stop
     qty: int = 0
+    exit_time: str = ""
+    exit: float = 0.0      # quantity-weighted average exit price
     reason: str = ""
-    pnl: float = 0.0   # net of costs and slippage, rupees
-    r: float = 0.0     # net P&L in units of initial risk
+    pnl: float = 0.0       # net of costs and slippage, rupees
+    costs: float = 0.0
+    r: float = 0.0         # net P&L / initial price risk
+    open_qty: int = 0
+    exit_value: float = 0.0
 
 
 @dataclass
 class Config:
+    """Every default below is the value written in STRATEGIES.md."""
     capital: float = 500000.0
     risk_pct: float = 0.005              # 0.5% of equity per trade
     lot: int = 65                        # Nifty lot from Jan 2026
     segment: str = "futures"
     slippage_pts: float = 1.0            # per side, in price points
+    fixed_lots: int = 0                  # >0: always trade this many lots (ignores risk sizing)
+    expiry_rule: str = "none"            # "weekly_tue" (Nifty) / "monthly_last_tue" (Bank Nifty)
+    start: Optional[date] = None         # only take trades on/after this date
+    end: Optional[date] = None
     or_minutes: int = 15                 # 09:15-09:30 opening range
-    last_entry: time = time(13, 30)
     flat_time: time = time(15, 10)
-    max_trades_per_day: int = 2
-    daily_loss_r: float = 2.0            # stop for the day after -2R
     atr_len: int = 14                    # daily ATR length
-    buffer_atr: float = 0.05             # breakout buffer as fraction of daily ATR
-    min_rr_target: float = 2.0
-    max_cost_frac: float = 0.25          # skip if round-trip cost > 25% of rupee risk
+    max_cost_frac: float = 0.25          # skip if cost + slippage > 25% of price risk
+    daily_max_losses: int = 3
+    daily_loss_r: float = 3.0            # -3R = -1.5% at 0.5% risk
+    # A  ORB-VWAP
+    buffer_atr: float = 0.05
+    or_min_atr: float = 0.25
+    or_max_atr: float = 0.8
+    wide_day_atr: float = 1.5
+    gap_skip_atr: float = 1.0
+    orb_stop_atr: float = 0.5
+    orb_last_entry: time = time(11, 30)
+    # B  Holy Grail
     ema_len: int = 20
     adx_len: int = 14
-    adx_min: float = 30.0                # Raschke Holy Grail threshold
-    nr_lookback: int = 7                 # Crabel NR7
-    vol_mult: float = 0.5                # Williams-style % of prior range
+    adx_min: float = 30.0                # on 15-minute bars
+    hg_target_r: float = 2.0
+    hg_max_pullbacks: int = 2
+    hg_last_entry: time = time(14, 30)
+    # C  Failed breakout
+    fade_breach_atr: float = 0.1
+    fade_window_bars: int = 6            # 30 minutes
+    fade_stop_buf_atr: float = 0.05
+    fade_min_rr: float = 1.5
+    fade_time_stop_bars: int = 12        # 1 hour
+    fade_last_entry: time = time(14, 30)
+    # D  NR7
+    nr_lookback: int = 7
+    vol_mult: float = 0.5
+    nr7_stop_atr: float = 0.5
+    nr7_last_entry: time = time(12, 0)
+    expiry_last_entry: time = time(12, 0)  # B and C: no expiry-day afternoon entries
     trades: List[Trade] = field(default_factory=list)
+    skipped: Dict[str, int] = field(default_factory=dict)
 
 
 _ALIASES = {
@@ -421,146 +450,264 @@ def adx(bars: List[Bar], n: int) -> List[float]:
     return out
 
 
+def _adx15(bars: List[Bar], n: int):
+    """15-minute bars built from 5-minute bars (anchored 09:15) and, for every
+    5-minute bar, the index of the latest COMPLETED 15-minute bar."""
+    b15: List[Bar] = []
+    keys: List[tuple] = []
+    done = [-1] * len(bars)
+    last_done = -1
+    for i, b in enumerate(bars):
+        m = b.dt.hour * 60 + b.dt.minute - 555
+        key = (b.dt.date(), m // 15)
+        if keys and keys[-1] == key:
+            x = b15[-1]
+            x.h, x.l, x.c, x.v = max(x.h, b.h), min(x.l, b.l), b.c, x.v + b.v
+        else:
+            last_done = max(last_done, len(b15) - 1)   # previous slot is complete
+            keys.append(key)
+            b15.append(Bar(b.dt, b.o, b.h, b.l, b.c, b.v))
+        if m % 15 == 10:                               # third 5-min bar closes the slot
+            last_done = len(b15) - 1
+        done[i] = last_done
+    return adx(b15, n), done
+
+
+def _is_expiry(d: date, rule: str) -> bool:
+    if rule == "weekly_tue":
+        return d.weekday() == 1
+    if rule == "monthly_last_tue":
+        return d.weekday() == 1 and (d + timedelta(days=7)).month != d.month
+    return False
+
+
 def run_backtest(bars: List[Bar], strategy: str, cfg: Config) -> Config:
+    """Bar-by-bar simulation of one strategy (orb / holygrail / fade / nr7) with
+    the rules in STRATEGIES.md. Signals use CLOSED bars only; entry fills at the
+    signal bar's close plus slippage; stops fill at the worse of stop and open."""
     days = group_days(bars)
+    ema_all = ema([b.c for b in bars], cfg.ema_len)
+    adx15, done15 = _adx15(bars, cfg.adx_len)
     equity = cfg.capital
-    all_closes = [b.c for b in bars]
-    ema_all = ema(all_closes, cfg.ema_len)
-    adx_all = adx(bars, cfg.adx_len)
-    idx = 0
+    sk = cfg.skipped
+
+    seen: set = set()
+
+    def skip(reason: str) -> None:  # counted once per day per reason
+        key = (cur_day[0], reason)
+        if key not in seen:
+            seen.add(key)
+            sk[reason] = sk.get(reason, 0) + 1
+
+    cur_day = [None]
+
+    def adx_at(gi: int) -> Optional[float]:
+        k = done15[gi]
+        return adx15[k] if k >= 2 * cfg.adx_len else None
+
+    def adx_falling3(gi: int) -> bool:
+        k = done15[gi]
+        return k >= 3 and adx15[k] < adx15[k - 1] < adx15[k - 2] < adx15[k - 3]
+
+    gstart = 0
     for di, day in enumerate(days):
-        start_idx = idx
-        idx += len(day)
+        base = gstart
+        gstart += len(day)
         atr = daily_atr(days, di, cfg.atr_len)
-        if atr is None:
+        d = day[0].dt.date()
+        cur_day[0] = d
+        if atr is None or (cfg.start and d < cfg.start) or (cfg.end and d > cfg.end):
             continue
         prev = days[di - 1]
-        p_hi, p_lo = max(b.h for b in prev), min(b.l for b in prev)
-        prev_ranges = [max(b.h for b in d) - min(b.l for b in d)
-                       for d in days[max(0, di - cfg.nr_lookback):di]]
-        is_nr = len(prev_ranges) == cfg.nr_lookback and prev_ranges[-1] == min(prev_ranges)
-
-        or_bars = [b for b in day if b.dt.time() < _add_min(time(9, 15), cfg.or_minutes)]
+        p_hi, p_lo, p_c = max(b.h for b in prev), min(b.l for b in prev), prev[-1].c
+        p_rng = p_hi - p_lo
+        rngs = [max(b.h for b in x) - min(b.l for b in x) for x in days[di - cfg.nr_lookback:di]]
+        is_nr7 = len(rngs) == cfg.nr_lookback and p_rng <= min(rngs)
+        day_open = day[0].o
+        gap = abs(day_open - p_c)
+        expiry = _is_expiry(d, cfg.expiry_rule)
+        or_end = _add_min(time(9, 15), cfg.or_minutes)
+        or_bars = [b for b in day if b.dt.time() < or_end]
         if not or_bars:
             continue
         or_hi, or_lo = max(b.h for b in or_bars), min(b.l for b in or_bars)
-        buf = cfg.buffer_atr * atr
+        or_w = or_hi - or_lo
+
+        # ---- day-level permissions
+        allowed = True
+        if strategy == "orb":
+            if expiry:
+                allowed = False; skip("A: expiry day")
+            elif gap > cfg.gap_skip_atr * atr:
+                allowed = False; skip("A: gap > 1 ATR")
+            elif p_rng >= cfg.wide_day_atr * atr:
+                allowed = False; skip("A: yesterday wide-range day")
+            elif not (cfg.or_min_atr * atr <= or_w <= cfg.or_max_atr * atr):
+                allowed = False; skip("A: OR width outside 0.25-0.8 ATR")
+        elif strategy == "nr7":
+            if not is_nr7:
+                allowed = False
+            elif gap > cfg.gap_skip_atr * atr:
+                allowed = False; skip("D: NR7 but gap > 1 ATR")
+        if not allowed:
+            continue
+
+        lvl_up, lvl_dn = day_open + cfg.vol_mult * p_rng, day_open - cfg.vol_mult * p_rng
         cum_pv = cum_v = 0.0
+        vwap_prev = None
         pos: Optional[Trade] = None
-        trades_today, day_r = 0, 0.0
-        broke_up = broke_dn = False
-        sides_used = set()  # ORB rule: at most one long and one short per day
+        st: Dict[str, float] = {}
+        n_trades, losses, day_r = 0, 0, 0.0
+        sides_used: set = set()
+        breach_up = breach_dn = None
+        day_hi, day_lo = -math.inf, math.inf
+        pb_up = pb_dn = 0
+
+        def finish(px_raw: float, qty: int, b: Bar, why: str) -> None:
+            nonlocal equity, day_r, losses, pos
+            px = px_raw - pos.side * cfg.slippage_pts
+            buy, sell = (pos.entry, px) if pos.side > 0 else (px, pos.entry)
+            cost = round_trip_cost(cfg.segment, buy * qty, sell * qty)["total"]
+            net = (px - pos.entry) * pos.side * qty - cost
+            pos.pnl += net; pos.costs += cost; equity += net
+            pos.open_qty -= qty; pos.exit_value += px * qty
+            pos.reason = why if not pos.reason else pos.reason + "+" + why
+            if pos.open_qty == 0:
+                pos.exit_time = str(b.dt.time())
+                pos.exit = pos.exit_value / pos.qty
+                risk = abs(pos.entry - pos.stop) * pos.qty
+                pos.r = pos.pnl / risk if risk else 0.0
+                day_r += pos.r
+                losses += pos.pnl <= 0
+                pos = None
 
         for j, b in enumerate(day):
-            gi = start_idx + j
-            tp = (b.h + b.l + b.c) / 3
-            cum_pv += tp * (b.v or 1); cum_v += (b.v or 1)
-            vwap = cum_pv / cum_v
+            gi = base + j
             t = b.dt.time()
+            w = b.v if b.v > 0 else 1.0           # index data has no volume -> TWAP
+            cum_pv += (b.h + b.l + b.c) / 3 * w
+            cum_v += w
+            vwap = cum_pv / cum_v                  # known at this bar's close
 
-            # ---- manage open position (stop checked before target: conservative)
+            # ---------------- manage open position
             if pos:
-                hit_stop = (b.l <= pos.stop) if pos.side > 0 else (b.h >= pos.stop)
-                if hit_stop:
-                    # gap through stop fills at the worse of open and stop
-                    px = min(b.o, pos.stop) if pos.side > 0 else max(b.o, pos.stop)
-                    equity, day_r = _close(pos, b, px, "stop", cfg, equity, day_r)
-                    pos = None
-                elif t >= cfg.flat_time:
-                    equity, day_r = _close(pos, b, b.c, "time", cfg, equity, day_r)
-                    pos = None
-                elif strategy == "orb" and ((pos.side > 0 and b.c < vwap) or
-                                            (pos.side < 0 and b.c > vwap)):
-                    equity, day_r = _close(pos, b, b.c, "vwap_trail", cfg, equity, day_r)
-                    pos = None
-                elif strategy == "fade":
-                    tgt = vwap
-                    if (pos.side > 0 and b.h >= tgt) or (pos.side < 0 and b.l <= tgt):
-                        equity, day_r = _close(pos, b, tgt, "target_vwap", cfg, equity, day_r)
-                        pos = None
-                elif strategy == "holygrail":
-                    risk = abs(pos.entry - pos.stop)
-                    tgt = pos.entry + pos.side * cfg.min_rr_target * risk
-                    if (pos.side > 0 and b.h >= tgt) or (pos.side < 0 and b.l <= tgt):
-                        equity, day_r = _close(pos, b, tgt, "target_2R", cfg, equity, day_r)
-                        pos = None
-                continue
+                side = pos.side
+                if t >= cfg.flat_time:
+                    finish(b.o, pos.open_qty, b, "time_15:10")
+                else:
+                    stop = st["stop"]
+                    if (side > 0 and b.l <= stop) or (side < 0 and b.h >= stop):
+                        px = min(b.o, stop) if side > 0 else max(b.o, stop)
+                        finish(px, pos.open_qty, b, "stop" if not st.get("be") else "breakeven_stop")
+                    elif strategy == "holygrail" and not st.get("partial") and (
+                            (side > 0 and b.h >= st["target"]) or (side < 0 and b.l <= st["target"])):
+                        lots = pos.open_qty // cfg.lot
+                        if lots >= 2:
+                            finish(st["target"], (lots // 2) * cfg.lot, b, "half_at_2R")
+                            st["partial"] = True
+                        else:
+                            finish(st["target"], pos.open_qty, b, "target_2R(1 lot)")
+                    elif strategy == "fade" and vwap_prev is not None and (
+                            (side > 0 and b.h >= vwap_prev) or (side < 0 and b.l <= vwap_prev)):
+                        finish(vwap_prev, pos.open_qty, b, "target_vwap")
+                    elif strategy == "orb" and ((side > 0 and b.c < vwap) or (side < 0 and b.c > vwap)):
+                        finish(b.c, pos.open_qty, b, "vwap_trail")
+                    elif strategy == "holygrail" and st.get("partial") and (
+                            (side > 0 and b.c < ema_all[gi]) or (side < 0 and b.c > ema_all[gi])):
+                        finish(b.c, pos.open_qty, b, "ema_trail")
+                    elif strategy == "fade" and j - st["j"] >= cfg.fade_time_stop_bars:
+                        finish(b.c, pos.open_qty, b, "time_stop_1h")
+                    # breakeven at +1R (A, D) -- effective from the next bar
+                    if pos and strategy in ("orb", "nr7") and not st.get("be"):
+                        r1 = pos.entry + side * st["risk"]
+                        if (side > 0 and b.h >= r1) or (side < 0 and b.l <= r1):
+                            st["stop"] = pos.entry + side * (st["cost_unit"] + cfg.slippage_pts)
+                            st["be"] = True
 
-            # ---- entry gates
-            if (t < _add_min(time(9, 15), cfg.or_minutes) or t > cfg.last_entry
-                    or trades_today >= cfg.max_trades_per_day or day_r <= -cfg.daily_loss_r):
-                continue
+            # ---------------- state that must update every bar
+            prev_touch_up = gi > 0 and bars[gi - 1].l <= ema_all[gi - 1]
+            prev_touch_dn = gi > 0 and bars[gi - 1].h >= ema_all[gi - 1]
+            a15 = adx_at(gi)
+            if strategy == "fade":
+                if breach_up is None and b.h >= p_hi + cfg.fade_breach_atr * atr:
+                    breach_up = j
+                if breach_dn is None and b.l <= p_lo - cfg.fade_breach_atr * atr:
+                    breach_dn = j
+            day_hi, day_lo = max(day_hi, b.h), min(day_lo, b.l)
 
-            side, stop = 0, 0.0
-            if strategy == "orb":
-                if b.c > or_hi + buf and b.c > vwap:
-                    side, stop = 1, max(or_lo, b.c - 0.5 * atr)
-                elif b.c < or_lo - buf and b.c < vwap:
-                    side, stop = -1, min(or_hi, b.c + 0.5 * atr)
-            elif strategy == "nr7":
-                if is_nr:
-                    lvl_up = day[0].o + cfg.vol_mult * (p_hi - p_lo)
-                    lvl_dn = day[0].o - cfg.vol_mult * (p_hi - p_lo)
+            # ---------------- entries
+            side, stop, target = 0, 0.0, 0.0
+            if pos is None and t < cfg.flat_time and n_trades < 2 \
+                    and losses < cfg.daily_max_losses and day_r > -cfg.daily_loss_r:
+                if strategy == "orb" and or_end <= t <= cfg.orb_last_entry:
+                    buf = cfg.buffer_atr * atr
+                    if b.c > or_hi + buf and b.c > vwap and 1 not in sides_used:
+                        side, stop = 1, max(or_lo, b.c - cfg.orb_stop_atr * atr)
+                    elif b.c < or_lo - buf and b.c < vwap and -1 not in sides_used:
+                        side, stop = -1, min(or_hi, b.c + cfg.orb_stop_atr * atr)
+                elif strategy == "holygrail" and or_end <= t <= (
+                        cfg.expiry_last_entry if expiry else cfg.hg_last_entry):
+                    if a15 is not None and a15 >= cfg.adx_min and not adx_falling3(gi) and gi >= 6:
+                        pb = bars[gi - 1]
+                        up = ema_all[gi - 1] > ema_all[gi - 6]
+                        if up and prev_touch_up and 1 <= pb_up <= cfg.hg_max_pullbacks and b.c > pb.h:
+                            side, stop = 1, pb.l
+                        elif not up and prev_touch_dn and 1 <= pb_dn <= cfg.hg_max_pullbacks and b.c < pb.l:
+                            side, stop = -1, pb.h
+                elif strategy == "fade" and n_trades == 0 and time(9, 20) <= t <= (
+                        cfg.expiry_last_entry if expiry else cfg.fade_last_entry):
+                    trending = a15 is not None and a15 >= cfg.adx_min
+                    if not trending:
+                        if breach_up is not None and j - breach_up <= cfg.fade_window_bars and b.c < p_hi:
+                            side, stop, target = -1, day_hi + cfg.fade_stop_buf_atr * atr, vwap
+                        elif breach_dn is not None and j - breach_dn <= cfg.fade_window_bars and b.c > p_lo:
+                            side, stop, target = 1, day_lo - cfg.fade_stop_buf_atr * atr, vwap
+                        if side and (target - b.c) * side < cfg.fade_min_rr * abs(stop - b.c):
+                            skip("C: VWAP < 1.5R away"); side = 0
+                elif strategy == "nr7" and n_trades == 0 and time(9, 20) <= t <= cfg.nr7_last_entry:
                     if b.c > lvl_up:
-                        side, stop = 1, b.c - 0.5 * atr
+                        side, stop = 1, max(b.c - cfg.nr7_stop_atr * atr, lvl_dn)
                     elif b.c < lvl_dn:
-                        side, stop = -1, b.c + 0.5 * atr
-            elif strategy == "holygrail" and gi > 0:
-                prevb = bars[gi - 1]
-                e = ema_all[gi - 1]
-                if adx_all[gi - 1] >= cfg.adx_min:
-                    if ema_all[gi - 1] > ema_all[max(0, gi - 6)] and prevb.l <= e and b.c > prevb.h:
-                        side, stop = 1, prevb.l
-                    elif ema_all[gi - 1] < ema_all[max(0, gi - 6)] and prevb.h >= e and b.c < prevb.l:
-                        side, stop = -1, prevb.h
-            elif strategy == "fade":
-                # failed breakout of prior-day high/low: poke outside, close back inside
-                if b.h > p_hi:
-                    broke_up = True
-                if b.l < p_lo:
-                    broke_dn = True
-                if broke_up and b.c < p_hi and b.c > vwap:
-                    side, stop = -1, max(x.h for x in day[:j + 1])
-                elif broke_dn and b.c > p_lo and b.c < vwap:
-                    side, stop = 1, min(x.l for x in day[:j + 1])
+                        side, stop = -1, min(b.c + cfg.nr7_stop_atr * atr, lvl_up)
 
-            if side == 0 or (stop - b.c) * side >= 0:
-                continue
-            if strategy == "orb" and side in sides_used:
-                continue
-            entry = b.c + side * cfg.slippage_pts  # fill at close of signal bar + slippage
-            dist = abs(entry - stop)
-            cost_unit = round_trip_cost(cfg.segment, entry * cfg.lot, entry * cfg.lot)["total"] / cfg.lot
-            if cost_unit + 2 * cfg.slippage_pts > cfg.max_cost_frac * dist:
-                continue  # stop too tight relative to friction: edge eaten by costs
-            qty = units_for_risk(equity, cfg.risk_pct, dist + cfg.slippage_pts, cost_unit, cfg.lot)
-            if qty == 0:
-                continue  # one lot already exceeds the risk budget -> no trade
-            pos = Trade(str(b.dt.date()), side, str(t), entry, stop, qty=qty)
-            trades_today += 1
-            sides_used.add(side)
-            cfg.trades.append(pos)
+            if side and (stop - b.c) * side < 0:
+                entry = b.c + side * cfg.slippage_pts
+                dist = abs(entry - stop)
+                cost_unit = round_trip_cost(cfg.segment, entry * cfg.lot, entry * cfg.lot)["total"] / cfg.lot
+                if cost_unit + 2 * cfg.slippage_pts > cfg.max_cost_frac * dist:
+                    skip(f"{strategy}: stop too tight for costs")
+                else:
+                    qty = cfg.fixed_lots * cfg.lot if cfg.fixed_lots else units_for_risk(
+                        equity, cfg.risk_pct, dist + cfg.slippage_pts, cost_unit, cfg.lot)
+                    if qty == 0:
+                        skip(f"{strategy}: 1 lot exceeds risk budget")
+                    else:
+                        pos = Trade(str(d), side, str(t), entry, stop, qty=qty, open_qty=qty)
+                        st = {"stop": stop, "risk": dist, "cost_unit": cost_unit, "j": j,
+                              "target": entry + side * cfg.hg_target_r * dist}
+                        cfg.trades.append(pos)
+                        n_trades += 1
+                        sides_used.add(side)
 
-        if pos:  # safety: flatten at last bar
-            equity, day_r = _close(pos, day[-1], day[-1].c, "eod", cfg, equity, day_r)
+            # pullback episode counting (Holy Grail): reset when ADX < 30 or at day start
+            if strategy == "holygrail":
+                if a15 is None or a15 < cfg.adx_min:
+                    pb_up = pb_dn = 0
+                else:
+                    if b.l <= ema_all[gi] and not prev_touch_up:
+                        pb_up += 1
+                    if b.h >= ema_all[gi] and not prev_touch_dn:
+                        pb_dn += 1
+            vwap_prev = vwap
+
+        if pos:  # data ended before 15:10
+            finish(day[-1].c, pos.open_qty, day[-1], "eod")
     return cfg
 
 
 def _add_min(t: time, m: int) -> time:
     tot = t.hour * 60 + t.minute + m
     return time(tot // 60, tot % 60)
-
-
-def _close(pos: Trade, b: Bar, px: float, reason: str, cfg: Config, equity: float, day_r: float):
-    px = px - pos.side * cfg.slippage_pts
-    buy_px, sell_px = (pos.entry, px) if pos.side > 0 else (px, pos.entry)
-    gross = (px - pos.entry) * pos.side * pos.qty
-    cost = round_trip_cost(cfg.segment, buy_px * pos.qty, sell_px * pos.qty)["total"]
-    pos.exit, pos.exit_time, pos.reason = px, str(b.dt.time()), reason
-    pos.pnl = gross - cost
-    risk_rs = abs(pos.entry - pos.stop) * pos.qty
-    pos.r = pos.pnl / risk_rs if risk_rs else 0.0
-    return equity + pos.pnl, day_r + pos.r
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +743,8 @@ def stats(cfg: Config) -> Dict[str, float]:
         "expectancy_rs": statistics.mean(pnl),
         "expectancy_R": statistics.mean(t.r for t in tr),
         "net_pnl": sum(pnl),
+        "total_R": sum(t.r for t in tr),
+        "costs_paid": sum(t.costs for t in tr),
         "max_drawdown": mdd,
         "max_consec_losses": max_run,
         # per traded day, annualised with 245 sessions; non-trading days excluded
@@ -710,6 +859,10 @@ def main(argv: List[str]) -> None:
     ap.add_argument("--risk", type=float, default=0.5, help="risk per trade in %% of equity (default 0.5)")
     ap.add_argument("--slippage", type=float, default=None, help="per side, in price points/rupees")
     ap.add_argument("--out", default="trades_out.csv", help="CSV file for the trades command")
+    ap.add_argument("--start", help="only trade from this date, YYYY-MM-DD (earlier data warms up ATR/ADX)")
+    ap.add_argument("--end", help="only trade until this date, YYYY-MM-DD")
+    ap.add_argument("--lots", type=int, default=0,
+                    help="always trade exactly N lots (ignores --capital/--risk sizing)")
     a = ap.parse_args(argv[1:])
 
     if a.command == "costs":
@@ -732,37 +885,57 @@ def main(argv: List[str]) -> None:
     if a.command == "help":
         ap.print_help(); print(__doc__); return
 
-    presets = {"nifty": (65, "futures", 1.0), "banknifty": (30, "futures", 2.0),
-               "stock": (1, "equity_intraday", 0.1)}
-    lot, seg, slip = presets[a.instrument]
+    presets = {"nifty": (65, "futures", 1.0, "weekly_tue"),
+               "banknifty": (30, "futures", 2.0, "monthly_last_tue"),
+               "stock": (1, "equity_intraday", 0.1, "none")}
+    lot, seg, slip, expiry_rule = presets[a.instrument]
     if a.command == "selftest":
         bars = _synthetic()
     else:
         if not a.csv:
             ap.error("give a CSV path, e.g. run.sh backtest my_nifty_5min.csv")
         bars = load_csv(a.csv)
+    start = date.fromisoformat(a.start) if a.start else None
+    end = date.fromisoformat(a.end) if a.end else None
     strategies = list(STRATEGY_NAMES) if a.strategy == "all" else [a.strategy]
     if a.command == "trades" and os.path.exists(a.out):
         os.remove(a.out)
+    sizing = f"fixed {a.lots} lot(s)" if a.lots else f"capital Rs {a.capital:,.0f}, risk {a.risk}%/trade"
+    print(f"  instrument={a.instrument} lot={lot} slippage={a.slippage if a.slippage is not None else slip}"
+          f"/side, {sizing}, window={start or 'all'} to {end or 'all'}\n")
+    print(f"  {'Strategy':28s} {'Trades':>6s} {'Win%':>6s} {'Net Rs':>10s} {'Total R':>8s} "
+          f"{'Exp R':>7s} {'PF':>6s} {'MaxDD':>6s} {'Costs Rs':>9s}")
+    all_trades = []
     for s in strategies:
         cfg = Config(capital=a.capital, risk_pct=a.risk / 100, lot=lot, segment=seg,
-                     slippage_pts=a.slippage if a.slippage is not None else slip)
+                     slippage_pts=a.slippage if a.slippage is not None else slip,
+                     fixed_lots=a.lots, expiry_rule=expiry_rule, start=start, end=end)
         if a.command == "selftest":
             cfg.capital = 2500000.0
         cfg = run_backtest(bars, s, cfg)
-        res = stats(cfg)
-        print(f"{STRATEGY_NAMES[s]:30s}", {k: (round(v, 3) if isinstance(v, float) else v)
-                                          for k, v in res.items()})
-        if res.get("trades", 0) == 0:
-            print("    0 trades: no setup qualified, OR one lot's risk exceeded your budget / the "
-                  "cost filter. Try --instrument stock, a larger --capital, or check data "
-                  "(needs 15+ trading days: daily ATR uses the previous 14 days).")
+        r = stats(cfg)
+        if r.get("trades", 0) == 0:
+            print(f"  {STRATEGY_NAMES[s]:28s} {0:>6d}   no qualifying trades")
+        else:
+            pf = r["profit_factor"]
+            print(f"  {STRATEGY_NAMES[s]:28s} {r['trades']:>6d} {r['win_rate'] * 100:>5.0f}% "
+                  f"{r['net_pnl']:>10,.0f} {r['total_R']:>8.2f} {r['expectancy_R']:>7.2f} "
+                  f"{(f'{pf:.2f}' if pf != float('inf') else 'inf'):>6s} {r['max_drawdown'] * 100:>5.1f}% "
+                  f"{r['costs_paid']:>9,.0f}")
+        if cfg.skipped:
+            print("      filtered out (days): " + "; ".join(f"{k} x{v}" for k, v in sorted(cfg.skipped.items())))
+        done = [t for t in cfg.trades if t.exit_time]
+        all_trades += [(s, t) for t in done]
         if a.command == "trades":
-            _write_trades(a.out, [t for t in cfg.trades if t.exit_time], s)
+            _write_trades(a.out, done, s)
+    if all_trades:
+        tot = sum(t.pnl for _, t in all_trades)
+        print(f"\n  ALL STRATEGIES: {len(all_trades)} trades, net Rs {tot:,.0f}, "
+              f"total {sum(t.r for _, t in all_trades):.2f}R")
     if a.command == "trades":
-        print(f"Trade list written to {a.out}")
+        print(f"  Trade list written to {a.out}")
     if a.command == "selftest":
-        print("(synthetic random-walk data: every strategy should LOSE roughly its costs)")
+        print("  (synthetic random-walk data: every strategy should LOSE roughly its costs)")
 
 
 if __name__ == "__main__":

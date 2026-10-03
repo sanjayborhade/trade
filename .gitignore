@@ -1,3 +1,4 @@
 dist/
 trades_out.csv
 __pycache__/
+data/

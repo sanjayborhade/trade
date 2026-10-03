@@ -10,6 +10,8 @@ Research, four objective intraday strategies for NSE, and a backtest/risk toolki
 | **`STRATEGIES.md`** | **Start here.** One-page cards for the 4 strategies (A–D): exact entry, stop, exit, sizing and when not to trade |
 | `research/indian_intraday_playbook.md` | Full research: 5 documented traders, Indian market adaptation (2026 costs and rules), backtest framework, risk maths, regime matrix, playbook, decision tree, sources |
 | `tools/intraday_lab.py` | Cost calculator, position sizing, loss-streak/drawdown maths, backtester for the 4 strategies |
+| `tools/fetch_yahoo.py` | Downloads the last ~60 days of 5-minute Nifty / Bank Nifty / stock candles into `data/` |
+| `research/backtest_results_2026-09.md` | **Results: 1-month (Sep 2026) backtest of all 4 strategies** |
 | `templates/daily_checklist.md` | Printable pre-market → post-market checklist |
 | `templates/trade_journal.csv` | Journal template (open in Excel / Google Sheets) |
 | `sample_data/synthetic_5min.csv` | **Synthetic** random data, only to show the CSV format |
@@ -47,5 +49,7 @@ Research, four objective intraday strategies for NSE, and a backtest/risk toolki
 | `--capital` | Capital in ₹ |
 | `--risk` | Risk per trade in % (default 0.5) |
 | `--slippage` | Per-side slippage in points/₹ |
+| `--start` / `--end` | Only trade between these dates (YYYY-MM-DD); earlier data warms up ATR/ADX |
+| `--lots` | Always trade exactly N lots (ignores capital/risk sizing) |
 
 Costs use the post-1-April-2026 STT schedule. Edit `RATES` at the top of `tools/intraday_lab.py` if your broker's charges differ.
