@@ -91,12 +91,27 @@ def parse_hhmm(value: Any, field: str = "time") -> int:
     return t.hour * 60 + t.minute
 
 
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """Rejects duplicate keys: plain YAML would silently keep only the LAST 'data:' section."""
+
+    def construct_mapping(self, node, deep=False):
+        seen = {}
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise ConfigError(f"config.yaml defines '{key}' twice (lines {seen[key] + 1} and "
+                                  f"{key_node.start_mark.line + 1}). Only the second one would be used - "
+                                  f"delete or merge one of them.")
+            seen[key] = key_node.start_mark.line
+        return super().construct_mapping(node, deep)
+
+
 def load_config(path: str = "config.yaml") -> Dict[str, Any]:
     if not os.path.exists(path):
         raise ConfigError(f"Config file not found: {os.path.abspath(path)}")
     try:
         with open(path, encoding="utf-8") as f:
-            user = yaml.safe_load(f) or {}
+            user = yaml.load(f, Loader=_UniqueKeyLoader) or {}
     except yaml.YAMLError as e:
         hint = ""
         if "escape" in str(e):

@@ -67,13 +67,11 @@ def main():
     a = ap.parse_args()
     cfg, run_dir, log = start(a.config, "inspect", a.verbose)
     dcfg = cfg["data"]
+    log.info(f"DATA_FOLDER  = {dcfg['DATA_FOLDER']}\nfile_pattern = {dcfg['file_pattern']}")
     try:
         files = find_files(dcfg["DATA_FOLDER"], dcfg["file_pattern"])
     except DataFormatError as e:
         log.error(str(e))
-        sys.exit(3)
-    if not files:
-        log.error(f"No files matching '{dcfg['file_pattern']}' in {dcfg['DATA_FOLDER']}")
         sys.exit(3)
     log.info(f"Found {len(files)} file(s) in {dcfg['DATA_FOLDER']} "
              f"({sum(os.path.getsize(p) for p in files) / 1e6:,.0f} MB)")
