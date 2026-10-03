@@ -7,12 +7,15 @@ Standard library only (Python 3.9+). Nothing here is investment advice;
 every default is a starting assumption that must be checked against your
 broker's contract note and backtested before use.
 
-Usage:
-    python3 tools/intraday_lab.py costs      # round-trip cost tables
-    python3 tools/intraday_lab.py risk       # loss-streak / sizing tables
-    python3 tools/intraday_lab.py ruin       # Monte Carlo drawdown odds
-    python3 tools/intraday_lab.py backtest data.csv [orb|holygrail|fade|nr7]
-    python3 tools/intraday_lab.py selftest   # run on synthetic data
+Usage (or use run.sh / run.bat in the repo root):
+    python3 tools/intraday_lab.py costs        # round-trip cost tables
+    python3 tools/intraday_lab.py risk         # loss-streak / sizing tables
+    python3 tools/intraday_lab.py ruin         # Monte Carlo drawdown odds
+    python3 tools/intraday_lab.py selftest     # sanity check on random data
+    python3 tools/intraday_lab.py sample       # write a synthetic CSV to show the format
+    python3 tools/intraday_lab.py backtest data.csv --instrument nifty --capital 1000000 --risk 0.5
+    python3 tools/intraday_lab.py trades   data.csv --strategy orb --out trades.csv
+    Strategies: orb (A), holygrail (B), fade (C), nr7 (D). Instruments: nifty, banknifty, stock.
 
 CSV format for backtest (one row per 5-minute bar, IST, sorted):
     datetime,open,high,low,close,volume
@@ -23,6 +26,7 @@ from __future__ import annotations
 
 import csv
 import math
+import os
 import random
 import statistics
 import sys
@@ -293,6 +297,7 @@ def run_backtest(bars: List[Bar], strategy: str, cfg: Config) -> Config:
         pos: Optional[Trade] = None
         trades_today, day_r = 0, 0.0
         broke_up = broke_dn = False
+        sides_used = set()  # ORB rule: at most one long and one short per day
 
         for j, b in enumerate(day):
             gi = start_idx + j
@@ -369,6 +374,8 @@ def run_backtest(bars: List[Bar], strategy: str, cfg: Config) -> Config:
 
             if side == 0 or (stop - b.c) * side >= 0:
                 continue
+            if strategy == "orb" and side in sides_used:
+                continue
             entry = b.c + side * cfg.slippage_pts  # fill at close of signal bar + slippage
             dist = abs(entry - stop)
             cost_unit = round_trip_cost(cfg.segment, entry * cfg.lot, entry * cfg.lot)["total"] / cfg.lot
@@ -379,6 +386,7 @@ def run_backtest(bars: List[Bar], strategy: str, cfg: Config) -> Config:
                 continue  # one lot already exceeds the risk budget -> no trade
             pos = Trade(str(b.dt.date()), side, str(t), entry, stop, qty=qty)
             trades_today += 1
+            sides_used.add(side)
             cfg.trades.append(pos)
 
         if pos:  # safety: flatten at last bar
@@ -520,25 +528,88 @@ def _synthetic(n_days: int = 300, seed: int = 3) -> List[Bar]:
     return bars
 
 
+STRATEGY_NAMES = {"orb": "A  ORB-VWAP Trend", "holygrail": "B  Holy Grail Pullback",
+                  "fade": "C  Failed-Breakout Reversal", "nr7": "D  NR7 Volatility Breakout"}
+
+
+def _write_trades(path: str, trades: List[Trade], strategy: str) -> None:
+    new = not os.path.exists(path)
+    with open(path, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["strategy", "day", "side", "entry_time", "entry", "stop", "qty",
+                        "exit_time", "exit", "reason", "net_pnl_rs", "r_multiple"])
+        for t in trades:
+            w.writerow([strategy, t.day, "LONG" if t.side > 0 else "SHORT", t.entry_time,
+                        round(t.entry, 2), round(t.stop, 2), t.qty, t.exit_time,
+                        round(t.exit, 2), t.reason, round(t.pnl, 2), round(t.r, 3)])
+
+
 def main(argv: List[str]) -> None:
-    cmd = argv[1] if len(argv) > 1 else "costs"
-    if cmd == "costs":
-        _print_costs()
-    elif cmd == "risk":
-        _print_risk()
-    elif cmd == "ruin":
-        _print_ruin()
-    elif cmd in ("backtest", "selftest"):
-        bars = load_csv(argv[2]) if cmd == "backtest" else _synthetic()
-        strategies = [argv[3]] if cmd == "backtest" and len(argv) > 3 else ["orb", "holygrail", "fade", "nr7"]
-        for s in strategies:
-            cfg = Config() if cmd == "backtest" else Config(capital=2500000.0)
-            res = stats(run_backtest(bars, s, cfg))
-            print(s, {k: (round(v, 3) if isinstance(v, float) else v) for k, v in res.items()})
-        if cmd == "selftest":
-            print("(synthetic random-walk data: results should hover around zero minus costs)")
+    import argparse
+    ap = argparse.ArgumentParser(description="Indian intraday research toolkit (not investment advice)")
+    ap.add_argument("command", nargs="?", default="help",
+                    choices=["costs", "risk", "ruin", "selftest", "sample", "backtest", "trades", "help"])
+    ap.add_argument("csv", nargs="?", help="5-minute OHLCV CSV (datetime,open,high,low,close,volume)")
+    ap.add_argument("--strategy", default="all", choices=["all"] + list(STRATEGY_NAMES))
+    ap.add_argument("--instrument", default="nifty", choices=["nifty", "banknifty", "stock"],
+                    help="sets lot size, cost segment and default slippage")
+    ap.add_argument("--capital", type=float, default=1000000.0)
+    ap.add_argument("--risk", type=float, default=0.5, help="risk per trade in %% of equity (default 0.5)")
+    ap.add_argument("--slippage", type=float, default=None, help="per side, in price points/rupees")
+    ap.add_argument("--out", default="trades_out.csv", help="CSV file for the trades command")
+    a = ap.parse_args(argv[1:])
+
+    if a.command == "costs":
+        _print_costs(); return
+    if a.command == "risk":
+        _print_risk(); return
+    if a.command == "ruin":
+        _print_ruin(); return
+    if a.command == "sample":
+        path = a.csv or "sample_data/synthetic_5min.csv"
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["datetime", "open", "high", "low", "close", "volume"])
+            for b in _synthetic(120):
+                w.writerow([b.dt.isoformat(sep=" "), round(b.o, 2), round(b.h, 2),
+                            round(b.l, 2), round(b.c, 2), int(b.v)])
+        print(f"Wrote SYNTHETIC random-walk data to {path} (format example only, not market data)")
+        return
+    if a.command == "help":
+        ap.print_help(); print(__doc__); return
+
+    presets = {"nifty": (65, "futures", 1.0), "banknifty": (30, "futures", 2.0),
+               "stock": (1, "equity_intraday", 0.1)}
+    lot, seg, slip = presets[a.instrument]
+    if a.command == "selftest":
+        bars = _synthetic()
     else:
-        print(__doc__)
+        if not a.csv:
+            ap.error("give a CSV path, e.g. run.sh backtest my_nifty_5min.csv")
+        bars = load_csv(a.csv)
+    strategies = list(STRATEGY_NAMES) if a.strategy == "all" else [a.strategy]
+    if a.command == "trades" and os.path.exists(a.out):
+        os.remove(a.out)
+    for s in strategies:
+        cfg = Config(capital=a.capital, risk_pct=a.risk / 100, lot=lot, segment=seg,
+                     slippage_pts=a.slippage if a.slippage is not None else slip)
+        if a.command == "selftest":
+            cfg.capital = 2500000.0
+        cfg = run_backtest(bars, s, cfg)
+        res = stats(cfg)
+        print(f"{STRATEGY_NAMES[s]:30s}", {k: (round(v, 3) if isinstance(v, float) else v)
+                                          for k, v in res.items()})
+        if res.get("trades", 0) == 0:
+            print("    0 trades: no setup qualified, OR one lot's risk exceeded your budget / the "
+                  "cost filter. Try --instrument stock, a larger --capital, or check data.")
+        if a.command == "trades":
+            _write_trades(a.out, [t for t in cfg.trades if t.exit_time], s)
+    if a.command == "trades":
+        print(f"Trade list written to {a.out}")
+    if a.command == "selftest":
+        print("(synthetic random-walk data: every strategy should LOSE roughly its costs)")
 
 
 if __name__ == "__main__":

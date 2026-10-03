@@ -1,0 +1,1 @@
+date,time_in,time_out,instrument,strategy(A/B/C/D),side,regime(trend/range/gap/expiry/news),planned_entry,actual_entry,stop,qty,risk_rs,exit,exit_reason(stop/trail/target/time),gross_pnl,costs,net_pnl,r_multiple,followed_rules(Y/N),mistake_class(1-7),screenshot_file,emotion_1to5,notes
