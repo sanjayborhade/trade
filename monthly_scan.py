@@ -23,6 +23,8 @@ Holdings check (--holdings file.csv with a "symbol" column, optional
 "stop_loss"): flags positions whose monthly close is below the 10 EMA
 (exit at next open) or that broke their stop-loss.
 
+Self-contained: needs only this file and Python 3.9+.
+
 Usage
     pip install pandas numpy yfinance requests
     python monthly_scan.py
@@ -40,10 +42,25 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-from monthly_high_close_backtest import NIFTY500_URL, clean_daily
-
+NIFTY500_URL = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
 OUT_DIR = "scans"
 INDEX_TICKER = "^CRSLDX"  # NIFTY 500 index on Yahoo
+
+
+def clean_daily(d):
+    """Remove Yahoo data errors. NSE stocks move at most ~20% a day, so:
+    1. drop one-off spike bars that sit >50% away from the 7-day median;
+    2. if a jump of >+100% / <-60% remains (unadjusted split, demerger, bad
+       series), keep only the history after the last such jump."""
+    px = d[["Open", "High", "Low", "Close"]]
+    ratio = px.div(d["Close"].rolling(7, center=True, min_periods=1).median(), axis=0)
+    d = d[~((ratio > 1.5) | (ratio < 0.67)).any(axis=1)]
+    prev = d["Close"].shift()
+    jump = pd.concat([d["Close"] / prev - 1, d["Open"] / prev - 1], axis=1)
+    breaks = d.index[(jump.max(axis=1) > 1.0) | (jump.min(axis=1) < -0.6)]
+    if len(breaks):
+        d = d[d.index >= breaks[-1]]
+    return d
 
 
 def nifty500_symbols():
